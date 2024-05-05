@@ -11,24 +11,23 @@ import math
 import numpy as np
 import torch
 from torch import nn
-from torch.nn import Module, Parameter
 import torch.nn.functional as F
+from params import args
 
 
-
-class GNN(Module):
+class GNN(nn.Module):
     def __init__(self, hidden_size, step=1):
         super(GNN, self).__init__()
         self.step = step
         self.hidden_size = hidden_size
         self.input_size = hidden_size * 2
         self.gate_size = 3 * hidden_size
-        self.w_ih = Parameter(torch.Tensor(self.gate_size, self.input_size))
-        self.w_hh = Parameter(torch.Tensor(self.gate_size, self.hidden_size))
-        self.b_ih = Parameter(torch.Tensor(self.gate_size))
-        self.b_hh = Parameter(torch.Tensor(self.gate_size))
-        self.b_iah = Parameter(torch.Tensor(self.hidden_size))
-        self.b_oah = Parameter(torch.Tensor(self.hidden_size))
+        self.w_ih = nn.Parameter(torch.Tensor(self.gate_size, self.input_size))
+        self.w_hh = nn.Parameter(torch.Tensor(self.gate_size, self.hidden_size))
+        self.b_ih = nn.Parameter(torch.Tensor(self.gate_size))
+        self.b_hh = nn.Parameter(torch.Tensor(self.gate_size))
+        self.b_iah = nn.Parameter(torch.Tensor(self.hidden_size))
+        self.b_oah = nn.Parameter(torch.Tensor(self.hidden_size))
 
         self.linear_edge_in = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_edge_out = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
@@ -56,7 +55,7 @@ class GNN(Module):
         return hidden, hidden_his
 
 
-class SessionGraph(Module):
+class SessionGraph(nn.Module):
     def __init__(self, opt, n_node):
         super(SessionGraph, self).__init__()
         self.hidden_size = opt.hiddenSize
@@ -116,17 +115,17 @@ class Encoder:
         self.alias_inputs = torch.Tensor().long()
         self.items = torch.Tensor().long()
         self.A = torch.Tensor().float()
-        self.mask = torch.Tensor.long()
+        self.mask = torch.Tensor().long()
         self.targets = []
 
-    def forward(self, model, i, data):
-        alias_inputs, A, items, mask, targets = data.get_slice(i)
+    def forward(self, model, i, data, edge_mask=None):
+        alias_inputs, A, items, mask, targets = data.get_slice(i, edge_mask)
         self.alias_inputs = trans_to_cuda(torch.Tensor(alias_inputs).long())
         self.items = trans_to_cuda(torch.Tensor(items).long())
         self.A = trans_to_cuda(torch.Tensor(A).float())
         self.mask = trans_to_cuda(torch.Tensor(mask).long())
         self.targets = targets
-        hidden, hidden_his = model(items, A)
+        hidden, hidden_his = model(self.items, self.A)
         return hidden, hidden_his
 
     def compute(self, model, hidden):
@@ -135,15 +134,54 @@ class Encoder:
         return self.targets, model.compute_scores(seq_hidden, self.mask)
 
 
+class Decoder(nn.Module):
+    def __init__(self):
+        super(Decoder, self).__init__()
+        self.MLP = nn.Sequential(
+            nn.Linear(args.latdim * args.num_gcn_layers ** 2, args.latdim * args.num_gcn_layers, bias=True),
+            nn.ReLU(),
+            nn.Linear(args.latdim * args.num_gcn_layers, args.latdim, bias=True),
+            nn.ReLU(),
+            nn.Linear(args.latdim, 1, bias=True),
+            nn.Sigmoid()
+        )
+        self.apply(self.init_weights)
+
+    def forward(self, embeds, pos, neg):
+        # pos: (batch, 2), neg: (batch, num_reco_neg, 2)
+        pos_emb, neg_emb = [], []
+        for i in range(args.num_gcn_layers):
+            for j in range(args.num_gcn_layers):
+                pos_emb.append(embeds[i][pos[:,0]] * embeds[j][pos[:,1]])
+                neg_emb.append(embeds[i][neg[:,:,0]] * embeds[j][neg[:,:,1]])
+        pos_emb = torch.cat(pos_emb, -1) # (n, latdim * num_gcn_layers ** 2)
+        neg_emb = torch.cat(neg_emb, -1) # (n, num_reco_neg, latdim * num_gcn_layers ** 2)
+        pos_scr = torch.exp(torch.squeeze(self.MLP(pos_emb))) # (n)
+        neg_scr = torch.exp(torch.squeeze(self.MLP(neg_emb))) # (n, num_reco_neg)
+        neg_scr = torch.sum(neg_scr, -1) + pos_scr
+        loss = -torch.sum(pos_scr / (neg_scr + 1e-8) + 1e-8)
+        return loss
+
+    @staticmethod
+    def init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                module.bias.data.zero_()
+
+
 def train_test(model, train_data, test_data):
     encoder = Encoder()
+    decoder = Decoder()
     model.scheduler.step()
     print('start training: ', datetime.datetime.now())
     model.train()
+    decoder.train()
     total_loss = 0.0
     slices = train_data.generate_batch(model.batch_size)
     for i, j in zip(slices, np.arange(len(slices))):
         model.optimizer.zero_grad()
+        edge_mask = train_data.generate_mask(i)
         hidden, hidden_his = encoder.forward(model, i, train_data)
 
         targets, scores = encoder.compute(model, hidden)

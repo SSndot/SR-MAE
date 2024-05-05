@@ -8,6 +8,23 @@ Created on July, 2018
 
 import networkx as nx
 import numpy as np
+import random
+
+
+def random_unit(p):
+    assert 0 <= p <= 1
+    if p == 0:  # 概率为0，直接返回False
+        return False
+    if p == 1:  # 概率为1，直接返回True
+        return True
+    p_digits = len(str(p).split(".")[1])
+    interval_begin = 1
+    interval__end = pow(10, p_digits)
+    R = random.randint(interval_begin, interval__end)
+    if float(R) / interval__end < p:
+        return True
+    else:
+        return False
 
 
 def build_graph(train_data):
@@ -77,19 +94,32 @@ class Data():
         slices[-1] = slices[-1][:(self.length - batch_size * (n_batch - 1))]
         return slices
 
-    def get_slice(self, i):
+    def generate_mask(self, i):
+        inputs = self.inputs[i]
+        edge_mask = []
+        for u_input in inputs:
+            u_mask = []
+            for i, u in enumerate(u_input):
+                if random_unit(0.2):
+                    u_mask.append(i)
+            edge_mask.append(u_mask)
+        return edge_mask
+
+    def get_slice(self, i, edge_mask):
         inputs, mask, targets = self.inputs[i], self.mask[i], self.targets[i]
         items, n_node, A, alias_inputs = [], [], [], []
         for u_input in inputs:
             n_node.append(len(np.unique(u_input)))
         max_n_node = np.max(n_node)
-        for u_input in inputs:
+        for num, u_input in enumerate(inputs):
             node = np.unique(u_input)
             items.append(node.tolist() + (max_n_node - len(node)) * [0])
             u_A = np.zeros((max_n_node, max_n_node))
             for i in np.arange(len(u_input) - 1):
                 if u_input[i + 1] == 0:
                     break
+                if (edge_mask is not None) and (i in edge_mask[num]):
+                    continue
                 u = np.where(node == u_input[i])[0][0]
                 v = np.where(node == u_input[i + 1])[0][0]
                 u_A[u][v] = 1
